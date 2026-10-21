@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@streamoji/aitwin": "^0.7.4",
+    "@streamoji/aitwin": "^0.9.5",
     "livekit-client": "^2.22.3",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
