@@ -8,6 +8,8 @@ import {
 import {
   AiTwin,
   type AiTwinHandle,
+  type AiTwinSpeechChunk,
+  type TtsEngineId,
 } from '@streamoji/aitwin'
 import {
   Room,
@@ -18,7 +20,9 @@ import {
 
 type TextMode = 'chat' | 'say'
 
-function requireViteEnv(name: 'VITE_TOPIC_CHAT' | 'VITE_TOPIC_SPEAK'): string {
+function requireViteEnv(
+  name: 'VITE_TOPIC_CHAT' | 'VITE_TOPIC_SPEECH' | 'VITE_TOPIC_SAY',
+): string {
   const value = (import.meta.env[name] as string | undefined)?.trim()
   if (!value) {
     throw new Error(`Missing ${name} — set it in frontend/.env`)
@@ -27,7 +31,8 @@ function requireViteEnv(name: 'VITE_TOPIC_CHAT' | 'VITE_TOPIC_SPEAK'): string {
 }
 
 const TOPIC_CHAT = requireViteEnv('VITE_TOPIC_CHAT')
-const TOPIC_SPEAK = requireViteEnv('VITE_TOPIC_SPEAK')
+const TOPIC_SPEECH = requireViteEnv('VITE_TOPIC_SPEECH')
+const TOPIC_SAY = requireViteEnv('VITE_TOPIC_SAY')
 
 type ConnectPayload = {
   url: string
@@ -38,13 +43,50 @@ type ConnectPayload = {
   aitwinApiBase: string
 }
 
+type SpeechBeginMsg = {
+  type: 'begin'
+  text?: string
+  ttsEngineId?: string
+  sampleRate?: number
+}
+
+type SpeechChunkMsg = {
+  type: 'chunk'
+  audio?: string
+  sampleRate?: number
+  visemes?: AiTwinSpeechChunk['visemes']
+  words?: AiTwinSpeechChunk['words']
+  isNewSegment?: boolean
+  audioOffsetMs?: number
+}
+
+type SpeechEndMsg = { type: 'end' }
+
+type SpeechMsg = SpeechBeginMsg | SpeechChunkMsg | SpeechEndMsg
+
+function parseSpeechMsg(raw: string): SpeechMsg | null {
+  try {
+    const data = JSON.parse(raw) as SpeechMsg
+    if (!data || typeof data !== 'object' || !('type' in data)) return null
+    if (data.type === 'begin' || data.type === 'chunk' || data.type === 'end') {
+      return data
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
 export default function App() {
   const twinRef = useRef<AiTwinHandle | null>(null)
   const roomRef = useRef<Room | null>(null)
   const micTrackRef = useRef<LocalAudioTrack | null>(null)
   const speakingRef = useRef(false)
-  const queueRef = useRef<string[]>([])
+  const speechQueueRef = useRef<SpeechMsg[]>([])
   const twinReadyRef = useRef(false)
+  const speechOpenRef = useRef(false)
+  const lastAgentTextRef = useRef<string | null>(null)
+  const drainAllRef = useRef<() => void>(() => {})
 
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle')
   const [twinReady, setTwinReady] = useState(false)
@@ -63,60 +105,124 @@ export default function App() {
     apiBase: string
   } | null>(null)
 
-  // Keep a stable drain loop that always reads current readiness via refs
-  // (text-stream handlers capture callbacks from connect-time otherwise).
-  const speakQueued = useCallback(async () => {
+  const updateQueuedCount = useCallback(() => {
+    setQueuedCount(speechQueueRef.current.length)
+  }, [])
+
+  // Only agent-published chunks (TOPIC_SPEECH). Never twin.speakText /avatar_ttsWithPoses.
+  const drainAll = useCallback(async () => {
     if (speakingRef.current) return
     const twin = twinRef.current
     if (!twin || !twinReadyRef.current) return
-
-    const next = queueRef.current.shift()
-    if (!next) {
-      setQueuedCount(0)
-      return
-    }
-    setQueuedCount(queueRef.current.length)
+    if (!speechQueueRef.current.length) return
 
     speakingRef.current = true
-    setLastHeard(next)
     try {
-      console.log('[AiTwin] speakText', next.slice(0, 120))
-      await twin.speakText(next)
+      while (speechQueueRef.current.length) {
+        const msg = speechQueueRef.current.shift()
+        updateQueuedCount()
+        if (!msg) break
+
+        if (msg.type === 'begin') {
+          if (speechOpenRef.current) {
+            twin.endSpeech()
+            speechOpenRef.current = false
+          }
+          const text = (msg.text || '').trim()
+          if (text) {
+            lastAgentTextRef.current = text
+            setLastAgentText(text)
+            setLastHeard(text)
+          }
+          console.log('[AiTwin] beginSpeech', text.slice(0, 120))
+          await twin.beginSpeech({
+            ttsEngineId: msg.ttsEngineId as TtsEngineId | undefined,
+            spokenText: text || undefined,
+          })
+          speechOpenRef.current = true
+        } else if (msg.type === 'chunk') {
+          if (!speechOpenRef.current) {
+            await twin.beginSpeech({
+              spokenText: lastAgentTextRef.current ?? undefined,
+            })
+            speechOpenRef.current = true
+          }
+          const chunk: AiTwinSpeechChunk = {
+            audio: msg.audio || '',
+            sampleRate: msg.sampleRate,
+            visemes: msg.visemes || [],
+            words: msg.words || [],
+            isNewSegment: msg.isNewSegment ?? false,
+            audioOffsetMs: msg.audioOffsetMs ?? 0,
+          }
+          console.log(
+            '[AiTwin] pushSpeechChunk',
+            `visemes=${chunk.visemes.length}`,
+            `audio=${chunk.audio ? 'yes' : 'no'}`,
+            `sr=${chunk.sampleRate ?? 'default'}`,
+          )
+          await twin.pushSpeechChunk(chunk)
+        } else if (msg.type === 'end') {
+          if (speechOpenRef.current) {
+            twin.endSpeech()
+            speechOpenRef.current = false
+          }
+        }
+      }
     } catch (err) {
-      console.error('[AiTwin] speakText failed', err)
-      setError(err instanceof Error ? err.message : 'speakText failed')
+      console.error('[AiTwin] speech chunk pipeline failed', err)
+      setError(err instanceof Error ? err.message : 'speech pipeline failed')
+      if (speechOpenRef.current) {
+        try {
+          twin.endSpeech()
+        } catch {
+          /* ignore */
+        }
+        speechOpenRef.current = false
+      }
     } finally {
       speakingRef.current = false
-      if (queueRef.current.length) {
-        void speakQueued()
+      if (speechQueueRef.current.length) {
+        void drainAllRef.current()
       } else {
-        setQueuedCount(0)
+        updateQueuedCount()
       }
     }
-  }, [])
+  }, [updateQueuedCount])
 
-  const enqueueSpeak = useCallback(
-    (text: string, source: string) => {
-      const trimmed = text.trim()
-      if (!trimmed) return
-      console.log(`[enqueue:${source}]`, trimmed.slice(0, 120))
-      setLastAgentText(trimmed)
-      queueRef.current.push(trimmed)
-      setQueuedCount(queueRef.current.length)
-      void speakQueued()
+  useEffect(() => {
+    drainAllRef.current = () => {
+      void drainAll()
+    }
+  }, [drainAll])
+
+  const enqueueSpeechMsg = useCallback(
+    (msg: SpeechMsg, source: string) => {
+      console.log(`[enqueue-speech:${source}]`, msg.type)
+      speechQueueRef.current.push(msg)
+      updateQueuedCount()
+      void drainAll()
     },
-    [speakQueued],
+    [drainAll, updateQueuedCount],
   )
 
   useEffect(() => {
     twinReadyRef.current = twinReady
-    if (twinReady) void speakQueued()
-  }, [twinReady, speakQueued])
+    if (twinReady) void drainAll()
+  }, [twinReady, drainAll])
 
   const disconnect = useCallback(async () => {
-    queueRef.current = []
+    speechQueueRef.current = []
     speakingRef.current = false
     twinReadyRef.current = false
+    if (speechOpenRef.current) {
+      try {
+        twinRef.current?.endSpeech()
+      } catch {
+        /* ignore */
+      }
+      speechOpenRef.current = false
+    }
 
     const mic = micTrackRef.current
     micTrackRef.current = null
@@ -154,25 +260,28 @@ export default function App() {
 
   const attachTextHandlers = useCallback(
     (room: Room) => {
-      // TTS must come only from aitwin.speak. lk.transcription is also published by
-      // RoomIO during LLM generation; listening to both caused partial-then-full double speak.
-      room.registerTextStreamHandler(TOPIC_SPEAK, (reader, participantInfo) => {
+      room.registerTextStreamHandler(TOPIC_SPEECH, (reader, participantInfo) => {
         void (async () => {
           try {
-            const text = (await reader.readAll()).trim()
-            if (!text) return
+            const raw = (await reader.readAll()).trim()
+            if (!raw) return
             if (participantInfo.identity === room.localParticipant.identity) {
-              console.log('[skip local aitwin.speak]', text.slice(0, 80))
+              console.log('[skip local aitwin.speech]', raw.slice(0, 80))
               return
             }
-            enqueueSpeak(text, `${TOPIC_SPEAK}:${participantInfo.identity}`)
+            const msg = parseSpeechMsg(raw)
+            if (!msg) {
+              console.warn('[aitwin.speech] invalid JSON', raw.slice(0, 120))
+              return
+            }
+            enqueueSpeechMsg(msg, `${TOPIC_SPEECH}:${participantInfo.identity}`)
           } catch (err) {
-            console.warn(`${TOPIC_SPEAK} stream failed`, err)
+            console.warn(`${TOPIC_SPEECH} stream failed`, err)
           }
         })()
       })
     },
-    [enqueueSpeak],
+    [enqueueSpeechMsg],
   )
 
   const connect = useCallback(async () => {
@@ -269,10 +378,8 @@ export default function App() {
       setError(null)
       try {
         if (mode === 'say') {
-          if (!twinReadyRef.current) {
-            throw new Error('Twin is not ready yet — wait for the avatar to finish loading')
-          }
-          enqueueSpeak(text, 'local-say')
+          // Exact words via agent TTS + alignVisemes — never browser speakText /avatar_ttsWithPoses.
+          await room.localParticipant.sendText(text, { topic: TOPIC_SAY })
         } else {
           await room.localParticipant.sendText(text, { topic: TOPIC_CHAT })
         }
@@ -285,7 +392,7 @@ export default function App() {
         setSending(false)
       }
     },
-    [draft, enqueueSpeak, mode, sending],
+    [draft, mode, sending],
   )
 
   return (
@@ -293,10 +400,10 @@ export default function App() {
       <header className="header">
         <div>
           <p className="eyebrow">AiTwin × LiveKit Agents</p>
-          <h1>STT → LLM → text → AiTwin TTS</h1>
+          <h1>STT → LLM → LiveKit TTS + G2P → AiTwin</h1>
           <p className="lede">
-            LiveKit handles realtime conversation (mic STT + LLM). Agent audio is off;
-            AiTwin owns voice generation and avatar animation.
+            LiveKit runs conversation and synthesizes speech. Visemes come from G2P
+            (or HeadTTS). AiTwin plays the audio and drives lipsync — no agent audio track.
           </p>
         </div>
         <div className="actions">
@@ -405,7 +512,7 @@ export default function App() {
                   onChange={(e) => setDraft(e.target.value)}
                   placeholder={
                     mode === 'say'
-                      ? 'Exact words for AiTwin to speak…'
+                      ? 'Exact words → agent TTS + alignVisemes…'
                       : 'Ask the agent something…'
                   }
                   rows={3}
@@ -415,21 +522,23 @@ export default function App() {
                 </button>
                 <p className="hint">
                   {mode === 'say'
-                    ? 'Speak text → AiTwin TTS only (no LLM).'
-                    : 'Chat → LiveKit LLM → aitwin.speak → AiTwin TTS.'}
+                    ? 'Speak text → LiveKit TTS + alignVisemes (no LLM, no avatar_ttsWithPoses).'
+                    : 'Chat → LiveKit LLM → TTS + alignVisemes → aitwin.speech → lipsync.'}
                 </p>
               </form>
             </>
           ) : (
-            <p className="hint">Connect, then use mic and/or chat. Agent never publishes audio.</p>
+            <p className="hint">
+              Connect, then use mic and/or chat. Agent publishes speech chunks, not an audio track.
+            </p>
           )}
 
           <ol>
             <li>Connect (LiveKit room + AiTwin auth)</li>
             <li>
-              <strong>Mic</strong> → STT → LLM → text, or <strong>Chat</strong> for typed turns
+              <strong>Mic</strong> → STT → LLM, or <strong>Chat</strong> for typed turns
             </li>
-            <li>AiTwin speaks agent text via <code>speakText</code></li>
+            <li>Agent TTS + G2P → <code>aitwin.speech</code> → <code>pushSpeechChunk</code></li>
           </ol>
         </aside>
       </main>
